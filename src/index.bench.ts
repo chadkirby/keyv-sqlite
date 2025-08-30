@@ -1,8 +1,8 @@
 import { join } from "node:path";
-import Database from "better-sqlite3";
+import { DatabaseSync } from "node:sqlite";
 import { beforeAll, bench, describe } from "vitest";
 
-let sqlite: Database.Database;
+let sqlite: DatabaseSync;
 
 const sqliteFile = join(process.cwd(), "runtime", "cache.sqlite3");
 const cacheTableName = "caches";
@@ -12,7 +12,7 @@ const argsCount = 2;
 const keys = Array.from({ length: 10000 }, (_, i) => i + 1);
 
 beforeAll(async () => {
-  sqlite = new Database(sqliteFile);
+  sqlite = new DatabaseSync(sqliteFile);
 
   //sqlite.pragma("journal_mode = WAL");
 

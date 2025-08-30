@@ -1,5 +1,5 @@
 import EventEmitter from "node:events";
-import Database from "better-sqlite3";
+import { DatabaseSync } from "node:sqlite";
 import Keyv, { type KeyvStoreAdapter, type StoredData } from "keyv";
 
 type KeyvSqliteOptions = {
@@ -27,21 +27,26 @@ export class KeyvSqlite extends EventEmitter implements KeyvStoreAdapter {
   opts: KeyvSqliteOptions;
   namespace?: string;
 
-  sqlite: ReturnType<typeof Database>;
+  sqlite: DatabaseSync;
   fetchCaches: (...args: string[]) => CacheObject[];
   deleteCaches: (...args: string[]) => number;
-  updateCatches: (args: [string, unknown][], ttl?: number) => void;
+  updateCaches: (args: [string, unknown][], ttl?: number) => void;
   emptyCaches: () => void;
   findCaches: (namespace: string | undefined, limit: number, offset: number, expiredAt: number) => CacheObject[];
 
   constructor(options?: KeyvSqliteOptions) {
     super();
     this.ttlSupport = true;
-    this.opts = { dialect: "sqlite", table: "caches", busyTimeout: 5000, ...options };
-    this.sqlite = new Database(this.opts.uri, { timeout: this.opts.busyTimeout });
+    this.opts = { dialect: "sqlite", table: "caches", busyTimeout: 5000, uri: ":memory:", ...options };
+    if (!this.opts.uri) {
+      throw new Error("URI is required");
+    }
+    this.sqlite = new DatabaseSync(this.opts.uri);
+
+    this.sqlite.exec(`PRAGMA busy_timeout = ${this.opts.busyTimeout}`);
 
     if (this.opts.enableWALMode) {
-      this.sqlite.pragma("journal_mode = WAL");
+      this.sqlite.exec("PRAGMA journal_mode = WAL");
     }
 
     const tableName = this.opts.table;
@@ -56,10 +61,8 @@ export class KeyvSqlite extends EventEmitter implements KeyvStoreAdapter {
 CREATE INDEX IF NOT EXISTS idx_expired_caches ON ${tableName}(expiredAt);
 `);
 
-    const selectSingleStatement = this.sqlite.prepare<string, CacheObject>(
-      `SELECT * FROM ${tableName} WHERE cacheKey = ?`,
-    );
-    const selectStatement = this.sqlite.prepare<string, CacheObject>(
+    const selectSingleStatement = this.sqlite.prepare(`SELECT * FROM ${tableName} WHERE cacheKey = ?`);
+    const selectStatement = this.sqlite.prepare(
       `SELECT * FROM ${tableName} WHERE cacheKey IN (SELECT value FROM json_each(?))`,
     );
     const updateStatement = this.sqlite.prepare(
@@ -69,7 +72,7 @@ CREATE INDEX IF NOT EXISTS idx_expired_caches ON ${tableName}(expiredAt);
     const deleteStatement = this.sqlite.prepare(
       `DELETE FROM ${tableName} WHERE cacheKey IN (SELECT value FROM json_each(?))`,
     );
-    const finderStatement = this.sqlite.prepare<[string, number, number, number], CacheObject>(
+    const finderStatement = this.sqlite.prepare(
       `SELECT * FROM ${tableName} WHERE cacheKey LIKE ? AND (expiredAt = -1 OR expiredAt > ?) LIMIT ? OFFSET ?`,
     );
     const purgeStatement = this.sqlite.prepare(`DELETE FROM ${tableName} WHERE expiredAt != -1 AND expiredAt < ?`);
@@ -81,8 +84,7 @@ CREATE INDEX IF NOT EXISTS idx_expired_caches ON ${tableName}(expiredAt);
 
       const result =
         args.length >= 3
-          ? selectStatement
-              .all(JSON.stringify(args))
+          ? (selectStatement.all(JSON.stringify(args)) as CacheObject[])
               .map((data) => {
                 if (data.expiredAt !== -1 && data.expiredAt < ts) {
                   purgeExpired = true;
@@ -93,7 +95,7 @@ CREATE INDEX IF NOT EXISTS idx_expired_caches ON ${tableName}(expiredAt);
               .filter((data) => data !== undefined)
           : args
               .map((key) => {
-                const data = selectSingleStatement.get(key);
+                const data = selectSingleStatement.get(key) as CacheObject | undefined;
                 if (data !== undefined && data.expiredAt !== -1 && data.expiredAt < ts) {
                   purgeExpired = true;
                   return undefined;
@@ -112,23 +114,23 @@ CREATE INDEX IF NOT EXISTS idx_expired_caches ON ${tableName}(expiredAt);
 
     this.deleteCaches = (...args) => {
       if (args.length >= 3) {
-        return deleteStatement.run(JSON.stringify(args)).changes;
+        return Number(deleteStatement.run(JSON.stringify(args)).changes);
       }
 
       let changes = 0;
 
       for (const k of args) {
-        changes += deleteSingleStatement.run(k).changes;
+        changes += Number(deleteSingleStatement.run(k).changes);
       }
 
       return changes;
     };
 
-    this.updateCatches = (args, ttl) => {
+    this.updateCaches = (args: [string, unknown][], ttl?: number) => {
       const createdAt = now();
       const expiredAt = ttl != undefined && ttl != 0 ? createdAt + ttl * 1000 : -1;
 
-      for (const cache of args) updateStatement.run(cache[0], cache[1], createdAt, expiredAt);
+      for (const cache of args) updateStatement.run(cache[0], JSON.stringify(cache[1]), createdAt, expiredAt);
     };
 
     this.emptyCaches = () => {
@@ -136,9 +138,7 @@ CREATE INDEX IF NOT EXISTS idx_expired_caches ON ${tableName}(expiredAt);
     };
 
     this.findCaches = (namespace, limit, offset, expiredAt) => {
-      return finderStatement
-        .all(`${namespace ? `${namespace}:` : ""}%`, expiredAt, limit, offset)
-        .filter((data) => data !== undefined);
+      return finderStatement.all(`${namespace ? `${namespace}:` : ""}%`, expiredAt, limit, offset) as CacheObject[];
     };
   }
 
@@ -149,7 +149,7 @@ CREATE INDEX IF NOT EXISTS idx_expired_caches ON ${tableName}(expiredAt);
       return undefined;
     }
 
-    return rows[0].cacheData as Value;
+    return JSON.parse(rows[0].cacheData) as Value;
   }
 
   async getMany<Value>(keys: string[]): Promise<Array<StoredData<Value | undefined>>> {
@@ -158,14 +158,14 @@ CREATE INDEX IF NOT EXISTS idx_expired_caches ON ${tableName}(expiredAt);
     return keys.map((key) => {
       const row = rows.find((row) => row.cacheKey === key);
 
-      return (row ? row.cacheData : undefined) as StoredData<Value | undefined>;
+      return (row ? JSON.parse(row.cacheData) : undefined) as StoredData<Value | undefined>;
     });
   }
 
   async set<T>(key: string, value: T, ttl?: number) {
     return new Promise((resolve, reject) => {
       try {
-        this.updateCatches([[key, value]], ttl);
+        this.updateCaches([[key, value]], ttl);
         resolve(value);
       } catch (e) {
         reject(e);
@@ -205,7 +205,7 @@ CREATE INDEX IF NOT EXISTS idx_expired_caches ON ${tableName}(expiredAt);
       for (const entry of entries) {
         // biome-ignore lint: <explanation>
         offset += 1;
-        yield [entry.cacheKey, entry.cacheData];
+        yield [entry.cacheKey, JSON.parse(entry.cacheData)];
       }
 
       yield* iterate(offset);
